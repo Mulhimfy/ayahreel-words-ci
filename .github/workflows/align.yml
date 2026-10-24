@@ -1,0 +1,126 @@
+name: align
+# Runs a private project's jobs. Its code is checked out with a read-only
+# deploy key, and each job's output and log are encrypted before they
+# are uploaded, so nothing readable leaves a job. Inputs as the private
+# project's own align workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      voices:
+        description: comma-separated voice ids, or "targets"
+        default: targets
+      kind:
+        description: with "targets", only voices of this kind (ayah, surah, any)
+        default: any
+      model:
+        description: one model, or "first,second"
+        default: rabah8,mms8
+      policy:
+        description: single | rescue | pair
+        default: rescue
+      surahs:
+        description: only these surahs (e.g. "1,36,112-114"), one job per voice
+        default: ''
+      jobs:
+        description: 'explicit jobs, overriding the plan: [{"voice": "...", "surahs": "20-29"}, ...]'
+        default: ''
+      tag:
+        description: artifact name suffix, to tell runs apart
+        default: v1
+      hours:
+        description: audio hours per job (sets the shares)
+        default: '12'
+      limit:
+        description: at most this many jobs (the matrix holds 256)
+        default: '250'
+      parallel:
+        description: jobs at once (be kind to the audio hosts)
+        default: '10'
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - id: p
+        env:
+          VOICES: ${{ inputs.voices }}
+          KIND: ${{ inputs.kind }}
+          HOURS: ${{ inputs.hours }}
+          LIMIT: ${{ inputs.limit }}
+          SURAHS: ${{ inputs.surahs }}
+          JOBS: ${{ inputs.jobs }}
+        run: python3 -m pipeline.plan >> "$GITHUB_OUTPUT"
+  align:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.parallel) }}
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: deps
+        run: |
+          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -q -r requirements.txt
+      - id: key
+        env:
+          MODEL: ${{ inputs.model }}
+        run: echo "key=models-$(echo "$MODEL" | tr ',' '-')-v1" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ steps.key.outputs.key }}
+      - name: align
+        env:
+          VOICE: ${{ matrix.voice }}
+          SURAHS: ${{ matrix.surahs }}
+          MODEL: ${{ inputs.model }}
+          POLICY: ${{ inputs.policy }}
+        run: |
+          mkdir -p out log
+          if ! python -m pipeline.run_voice --voice "$VOICE" --surahs "$SURAHS" \
+              --model "$MODEL" --policy "$POLICY" --out out --work work \
+              > log/log.txt 2>&1; then
+            echo "the job failed; its log is in the encrypted output"
+            exit 1
+          fi
+          echo "done: $(find out -name '[0-9]*.json' | wc -l) surah file(s)"
+      - name: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          mkdir -p out log sealed
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:KEY -out sealed/words.tgz.enc
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY \
+            -in log/log.txt -out sealed/log.txt.enc 2>/dev/null || true
+          rm -rf out log work
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: words-${{ inputs.tag }}-${{ matrix.voice }}-${{ matrix.part }}
+          path: sealed
+          retention-days: 30
