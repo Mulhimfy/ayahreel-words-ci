@@ -1,0 +1,276 @@
+name: tables
+# Makes verse tables from a recording's audio, checks them, and asks
+# whether files from another host are the reciter's at all: the jobs of
+# the app's .github/workflows/verse-tables.yml, run here, where the
+# project's key is. The app's tools are taken from its public mirror at
+# `app_ref`; the private code by a read-only deploy key. Every table, and
+# every log and summary that says where verses are, is encrypted before
+# it is uploaded; the run's page says only whether each job and check
+# passed.
+on:
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: branch or commit of Mulhimfy/ayahReel-ci whose tool/ to run
+        required: true
+      sets:
+        description: job sets of tool/verse_table_jobs.json, space-separated
+        required: true
+      runs:
+        description: earlier runs here whose tables to check again (space-separated)
+        default: ''
+permissions:
+  contents: read
+  actions: read
+env:
+  # The ayahreel-words commit the app's tables are made with
+  # (verse-tables.yml's WORDS_SHA).
+  WORDS_SHA: af8fc300c5125b3a6ebc4ae2119880f6d2367df4
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+      speakers: ${{ steps.p.outputs.speakers }}
+      summary: ${{ steps.p.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahReel-ci
+          ref: ${{ inputs.app_ref }}
+          persist-credentials: false
+      - id: p
+        env:
+          SETS: ${{ inputs.sets }}
+        run: MESSAGE="[tables] $SETS" python3 -I tool/verse_table.py plan >> "$GITHUB_OUTPUT"
+
+  make:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahReel-ci
+          ref: ${{ inputs.app_ref }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: ${{ env.WORDS_SHA }}
+          path: words
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: words/requirements.txt
+      - name: deps
+        timeout-minutes: 60
+        run: |
+          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          pip install -q --timeout 60 --retries 5 torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -q --timeout 60 --retries 5 -r words/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: verse-tables-models-rabah8-v1
+      - name: make
+        env:
+          JOB: ${{ toJson(matrix) }}
+        run: |
+          id=$(jq -r .id <<<"$JOB"); base=$(jq -r .base <<<"$JOB")
+          surahs=$(jq -r .surahs <<<"$JOB")
+          urls=$(jq -c '.urls // {}' <<<"$JOB")
+          flags=""
+          [ "$(jq -r '.padded // true' <<<"$JOB")" = false ] && flags="--unpadded"
+          [ "$(jq -r '.keep_logp // false' <<<"$JOB")" = true ] && flags="$flags --keep-logp"
+          mkdir -p out log
+          status=0
+          python tool/verse_table.py make --words words --id "$id" \
+            --base "$base" --surahs "$surahs" --urls "$urls" --out out \
+            --work work $flags > log/make.txt 2>&1 || status=$?
+          echo "$(find out -name '[0-9]*.json' | wc -l) surah file(s); status $status"
+          exit $status
+      - name: seal
+        id: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo 'WORDS_ENC_KEY is not set: nothing is uploaded'; exit 1; }
+          mkdir -p out log sealed
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
+            -salt -pass env:KEY -out sealed/tables.tgz.enc
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY \
+            -in log/make.txt -out sealed/make.txt.enc 2>/dev/null || true
+          rm -rf out log work
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.seal.outcome == 'success'
+        with:
+          name: tables-${{ matrix.name }}
+          path: sealed
+          retention-days: 30
+
+  speaker:
+    needs: plan
+    if: needs.plan.outputs.speakers != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.speakers) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahReel-ci
+          ref: ${{ inputs.app_ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        timeout-minutes: 40
+        run: |
+          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          pip install -q --timeout 60 --retries 5 torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -q --timeout 60 --retries 5 numpy==1.26.4 speechbrain==1.0.3 huggingface_hub==0.25.2
+      - name: speaker
+        env:
+          JOB: ${{ toJson(matrix) }}
+        run: |
+          printf '%s' "$JOB" > job.json
+          mkdir -p log
+          status=0
+          python tool/verse_table.py speaker --job job.json --work work \
+            --json log/speaker.json > log/speaker.txt 2>&1 || status=$?
+          # Who is speaking, not when: the verdicts can show.
+          python3 -c "import json; d = json.load(open('log/speaker.json')); print('parted:', d['parted']); [print(k, v['verdict']) for k, v in d['cands'].items()]" || tail -n 30 log/speaker.txt
+          exit $status
+      - name: seal
+        id: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo 'WORDS_ENC_KEY is not set: nothing is uploaded'; exit 1; }
+          mkdir -p log sealed
+          tar -czf - -C log . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
+            -salt -pass env:KEY -out sealed/speaker.tgz.enc
+          rm -rf log work
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.seal.outcome == 'success'
+        with:
+          name: speaker-${{ matrix.name }}
+          path: sealed
+          retention-days: 30
+
+  summary:
+    needs: [plan, make]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.summary != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahReel-ci
+          ref: ${{ inputs.app_ref }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: ${{ env.WORDS_SHA }}
+          path: words
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        timeout-minutes: 40
+        run: |
+          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          pip install -q --timeout 60 --retries 5 numpy==1.26.4
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.matrix != '[]'
+        with:
+          pattern: tables-*
+          path: sealed
+      - name: earlier runs
+        if: inputs.runs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          for r in $RUNS; do
+            gh run download "$r" -R "$GITHUB_REPOSITORY" -p 'tables-*' -D "earlier/$r"
+          done
+      - name: unseal
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo 'WORDS_ENC_KEY is not set'; exit 1; }
+          mkdir -p out
+          # A surah made twice is taken from the later run.
+          for f in earlier/*/*/tables.tgz.enc sealed/*/tables.tgz.enc; do
+            [ -f "$f" ] || continue
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:KEY \
+              -in "$f" | tar -xzf - -C out
+          done
+          rm -rf sealed earlier
+          echo "$(find out -name '[0-9]*.json' | wc -l) surah file(s)"
+      - name: measure and check
+        env:
+          MATRIX: ${{ needs.plan.outputs.summary }}
+        run: |
+          mkdir -p summary
+          fail=0
+          for id in $(jq -r '[.[].id] | unique | .[]' <<<"$MATRIX"); do
+            job=$(jq -c --arg id "$id" '[.[] | select(.id == $id)][0]' <<<"$MATRIX")
+            truth=$(jq -r '.truth // empty' <<<"$job")
+            pub=$(jq -r '.published // empty' <<<"$job")
+            base=$(jq -r .base <<<"$job")
+            pad=$(jq -r 'if (.padded // true) then "SSS" else "S" end' <<<"$job")
+            el=""
+            if [ "$(jq -c '.urls // {}' <<<"$job")" != '{}' ]; then
+              jq -c '.urls' <<<"$job" > "summary/urls_$id.json"
+              el=" elsewhere summary/urls_$id.json"
+            fi
+            python3 -I tool/verse_table.py eval --words words --tables "out/$id" \
+              ${truth:+--truth "$truth"} ${pub:+--published "$pub"} \
+              --json "summary/eval_$id.json" > "summary/eval_$id.txt" 2>&1 || true
+            if VERSE_TABLES_DIR=out python3 -I tool/verify_reciters.py \
+                --check "surah $base $pad own $id$el" > "summary/check_$id.txt" 2>&1; then
+              echo "$id: check passed"
+            else
+              echo "$id: check failed (the sealed summary says why)"; fail=1
+            fi
+          done
+          exit $fail
+      - name: seal
+        id: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo 'WORDS_ENC_KEY is not set: nothing is uploaded'; exit 1; }
+          mkdir -p summary sealed
+          tar -czf - -C summary . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
+            -salt -pass env:KEY -out sealed/summary.tgz.enc
+          rm -rf summary out
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.seal.outcome == 'success'
+        with:
+          name: summary
+          path: sealed
+          retention-days: 30
