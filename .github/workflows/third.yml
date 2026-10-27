@@ -75,7 +75,16 @@ jobs:
           MODELS: ${{ inputs.models }}
           MODE: ${{ inputs.mode }}
         run: |
-          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          # ffmpeg without apt (its lock has held jobs here for half an
+          # hour): a static build from PyPI
+          if ! command -v ffmpeg >/dev/null; then
+            pip install -q imageio-ffmpeg==0.5.1
+            mkdir -p "$HOME/bin"
+            ln -sf "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" "$HOME/bin/ffmpeg"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/bin:$PATH"
+          fi
+          ffmpeg -version | head -1
           if [ "$MODELS" = fc ] && [ "$MODE" = dispute ]; then
             # FastConformer runs in its own environment: here only the
             # alignment's own needs
