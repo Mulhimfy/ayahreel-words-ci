@@ -83,6 +83,9 @@ jobs:
             ~/.cache/torch
           key: ${{ steps.key.outputs.key }}
       - name: run
+        # Short of the job's limit, so the seal below still runs and what
+        # was measured is kept.
+        timeout-minutes: 330
         env:
           MODE: ${{ inputs.mode }}
           VOICE: ${{ matrix.voice }}
