@@ -1,0 +1,127 @@
+name: third
+# More opinions on the verses two models can't settle (the private
+# project's pipeline/run_third.py): "eval" aligns ground-truth voices with
+# every model to measure what a third opinion may decide; "dispute" runs
+# the extra models on a voice's disputed verses. The code is checked out
+# with a read-only deploy key, and each job's output and log are
+# encrypted before they are uploaded: nothing readable leaves a job.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: eval | dispute
+        default: eval
+      jobs:
+        description: '[{"voice": "...", "surahs": "1,36"}, ...] (eval: per-ayah voices take "small" or "big")'
+        required: true
+      models:
+        description: comma-separated models, the first as production's first
+        default: rabah8,mms8,kuran,hamza
+      extra:
+        description: more arguments for run_third (e.g. --all)
+        default: ''
+      ref:
+        description: the private project's branch or commit
+        default: main
+      tag:
+        description: artifact name part, to tell runs apart
+        default: t1
+      parallel:
+        description: jobs at once (be kind to the audio hosts)
+        default: '12'
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - id: p
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          python3 -c "
+          import json, os
+          jobs = json.loads(os.environ['JOBS'])
+          m = [dict(voice=j['voice'], surahs=str(j.get('surahs', '')), part=i) for i, j in enumerate(jobs)]
+          open(os.environ['GITHUB_OUTPUT'], 'a').write('matrix=' + json.dumps(m) + '\n')
+          "
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.parallel) }}
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: deps
+        run: |
+          command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+          pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -q -r requirements.txt
+      - id: key
+        env:
+          MODELS: ${{ inputs.models }}
+        run: echo "key=models-$(echo "$MODELS" | tr ',' '-')-v1" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ steps.key.outputs.key }}
+      - name: run
+        env:
+          MODE: ${{ inputs.mode }}
+          VOICE: ${{ matrix.voice }}
+          SURAHS: ${{ matrix.surahs }}
+          MODELS: ${{ inputs.models }}
+          EXTRA: ${{ inputs.extra }}
+        run: |
+          mkdir -p out log
+          args=(--voice "$VOICE" --models "$MODELS" --out out --work work)
+          if [ "$MODE" = eval ]; then
+            case "$SURAHS" in
+              small|big) args+=(--sample "$SURAHS") ;;
+              *) args+=(--surahs "$SURAHS") ;;
+            esac
+          else
+            args+=(--jobs data/third_jobs.json)
+            [ -n "$SURAHS" ] && args+=(--surahs "$SURAHS")
+          fi
+          # shellcheck disable=SC2086
+          if ! python -m pipeline.run_third "$MODE" "${args[@]}" $EXTRA \
+              > log/log.txt 2>&1; then
+            echo "the job failed; its log is in the encrypted output"
+            exit 1
+          fi
+          echo "done"
+      - name: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          mkdir -p out log sealed
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:KEY -out sealed/third.tgz.enc
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY \
+            -in log/log.txt -out sealed/log.txt.enc 2>/dev/null || true
+          rm -rf out log work
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: third-${{ inputs.tag }}-${{ matrix.voice }}-${{ matrix.part }}
+          path: sealed
+          retention-days: 30
