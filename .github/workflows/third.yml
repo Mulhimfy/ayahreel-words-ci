@@ -72,6 +72,16 @@ jobs:
           command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
           pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           pip install -q -r requirements.txt
+      - name: deps for the FastConformer model (its own environment, NeMo's pins)
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          if echo "$MODELS" | tr ',' '\n' | grep -qx fc; then
+            python -m venv /tmp/fcenv
+            /tmp/fcenv/bin/pip install -q --extra-index-url https://download.pytorch.org/whl/cpu \
+              "nemo-toolkit[asr]==3.0.0" torch torchaudio soundfile safetensors pyyaml huggingface_hub
+            echo "FC_PYTHON=/tmp/fcenv/bin/python" >> "$GITHUB_ENV"
+          fi
       - id: key
         env:
           MODELS: ${{ inputs.models }}
