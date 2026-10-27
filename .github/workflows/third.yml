@@ -71,20 +71,38 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: deps
+        env:
+          MODELS: ${{ inputs.models }}
+          MODE: ${{ inputs.mode }}
         run: |
           command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
-          pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install -q -r requirements.txt
-      - name: deps for the FastConformer model (its own environment, NeMo's pins)
+          if [ "$MODELS" = fc ] && [ "$MODE" = dispute ]; then
+            # FastConformer runs in its own environment: here only the
+            # alignment's own needs
+            pip install -q numpy==1.26.4 numba==0.60.0
+          else
+            pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+            pip install -q -r requirements.txt
+          fi
+      - id: fcneed
         env:
           MODELS: ${{ inputs.models }}
         run: |
-          if echo "$MODELS" | tr ',' '\n' | grep -qx fc; then
+          if echo "$MODELS" | tr ',' '\n' | grep -qx fc; then echo "on=1" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/cache@v4
+        if: steps.fcneed.outputs.on == '1'
+        with:
+          path: /tmp/fcenv
+          key: fcenv-nemo3.0.0-py3.11-v1
+      - name: deps for the FastConformer model (its own environment, NeMo's pins)
+        if: steps.fcneed.outputs.on == '1'
+        run: |
+          if [ ! -x /tmp/fcenv/bin/python ]; then
             python -m venv /tmp/fcenv
             /tmp/fcenv/bin/pip install -q --extra-index-url https://download.pytorch.org/whl/cpu \
               "nemo-toolkit[asr]==3.0.0" torch torchaudio soundfile safetensors pyyaml huggingface_hub
-            echo "FC_PYTHON=/tmp/fcenv/bin/python" >> "$GITHUB_ENV"
           fi
+          echo "FC_PYTHON=/tmp/fcenv/bin/python" >> "$GITHUB_ENV"
       - id: key
         env:
           MODELS: ${{ inputs.models }}
