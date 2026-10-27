@@ -29,6 +29,9 @@ on:
       parallel:
         description: jobs at once (be kind to the audio hosts)
         default: '12'
+      jobs_file:
+        description: 'dispute: the private project''s jobs file'
+        default: data/third_jobs.json
 permissions:
   contents: read
 jobs:
@@ -102,6 +105,7 @@ jobs:
           SURAHS: ${{ matrix.surahs }}
           MODELS: ${{ inputs.models }}
           EXTRA: ${{ inputs.extra }}
+          JOBS_FILE: ${{ inputs.jobs_file }}
         run: |
           mkdir -p out log
           args=(--voice "$VOICE" --models "$MODELS" --out out --work work)
@@ -111,7 +115,7 @@ jobs:
               *) args+=(--surahs "$SURAHS") ;;
             esac
           else
-            args+=(--jobs data/third_jobs.json)
+            args+=(--jobs "${JOBS_FILE:-data/third_jobs.json}")
             [ -n "$SURAHS" ] && args+=(--surahs "$SURAHS")
           fi
           # shellcheck disable=SC2086
