@@ -85,7 +85,7 @@ jobs:
             export PATH="$HOME/bin:$PATH"
           fi
           ffmpeg -version | head -1
-          if [ "$MODELS" = fc ] && [ "$MODE" = dispute ]; then
+          if echo "$MODELS" | grep -qE '^(fc|fcr[a-z0-9]*)(,(fc|fcr[a-z0-9]*))*$' && [ "$MODE" = dispute ]; then
             # FastConformer runs in its own environment: here only the
             # alignment's own needs
             pip install -q numpy==1.26.4 numba==0.60.0
@@ -97,7 +97,8 @@ jobs:
         env:
           MODELS: ${{ inputs.models }}
         run: |
-          if echo "$MODELS" | tr ',' '\n' | grep -qx fc; then echo "on=1" >> "$GITHUB_OUTPUT"; fi
+          if echo "$MODELS" | tr ',' '\n' | grep -qE '^fc'; then echo "on=1" >> "$GITHUB_OUTPUT"; fi
+          if echo "$MODELS" | tr ',' '\n' | grep -qE '^fcr'; then echo "own=1" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/cache@v4
         if: steps.fcneed.outputs.on == '1'
         with:
@@ -112,6 +113,27 @@ jobs:
               "nemo-toolkit[asr]==3.0.0" torch torchaudio soundfile safetensors pyyaml huggingface_hub
           fi
           echo "FC_PYTHON=/tmp/fcenv/bin/python" >> "$GITHUB_ENV"
+      # Our own fine-tuned weights (fcr*): the private project's "weights"
+      # branch, with the same read-only key; never printed or uploaded.
+      - uses: actions/checkout@v4
+        if: steps.fcneed.outputs.own == '1'
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: weights
+          path: wts
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: our weights
+        if: steps.fcneed.outputs.own == '1'
+        run: |
+          for d in wts/fcr*/; do
+            if ls "$d"model.safetensors.part* >/dev/null 2>&1; then
+              cat "$d"model.safetensors.part* > "$d"model.safetensors
+              rm -f "$d"model.safetensors.part*
+            fi
+          done
+          rm -rf wts/.git
+          echo "FCR_ROOT=$PWD/wts" >> "$GITHUB_ENV"
       - id: key
         env:
           MODELS: ${{ inputs.models }}
@@ -162,7 +184,7 @@ jobs:
             -pass env:KEY -out sealed/third.tgz.enc
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY \
             -in log/log.txt -out sealed/log.txt.enc 2>/dev/null || true
-          rm -rf out log work
+          rm -rf out log work wts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
