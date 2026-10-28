@@ -98,7 +98,7 @@ jobs:
           MODELS: ${{ inputs.models }}
         run: |
           if echo "$MODELS" | tr ',' '\n' | grep -qE '^fc'; then echo "on=1" >> "$GITHUB_OUTPUT"; fi
-          if echo "$MODELS" | tr ',' '\n' | grep -qE '^fcr'; then echo "own=1" >> "$GITHUB_OUTPUT"; fi
+          if echo "$MODELS" | tr ',' '\n' | grep -qE '^(fcr|w2r)'; then echo "own=1" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/cache@v4
         if: steps.fcneed.outputs.on == '1'
         with:
@@ -113,7 +113,7 @@ jobs:
               "nemo-toolkit[asr]==3.0.0" torch torchaudio soundfile safetensors pyyaml huggingface_hub
           fi
           echo "FC_PYTHON=/tmp/fcenv/bin/python" >> "$GITHUB_ENV"
-      # Our own fine-tuned weights (fcr*): the private project's "weights"
+      # Our own fine-tuned weights (fcr*, w2r*): the private project's "weights"
       # branch, with the same read-only key; never printed or uploaded.
       - uses: actions/checkout@v4
         if: steps.fcneed.outputs.own == '1'
@@ -126,7 +126,7 @@ jobs:
       - name: our weights
         if: steps.fcneed.outputs.own == '1'
         run: |
-          for d in wts/fcr*/; do
+          for d in wts/*/; do
             if ls "$d"model.safetensors.part* >/dev/null 2>&1; then
               cat "$d"model.safetensors.part* > "$d"model.safetensors
               rm -f "$d"model.safetensors.part*
