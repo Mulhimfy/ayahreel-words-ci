@@ -1,0 +1,171 @@
+name: third
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: eval | dispute
+        default: eval
+      jobs:
+        description: '[{"voice": "...", "surahs": "1,36"}, ...] (eval: per-ayah voices take "small" or "big")'
+        required: true
+      models:
+        description: comma-separated model aliases (pipeline/alias.py), the first as production's first
+        default: m1,m2,m3,m4
+      extra:
+        description: more arguments for run_third (e.g. --all)
+        default: ''
+      ref:
+        description: the private project's branch or commit
+        default: main
+      tag:
+        description: artifact name part, to tell runs apart
+        default: t1
+      parallel:
+        description: jobs at once (be kind to the audio hosts)
+        default: '12'
+      jobs_file:
+        description: 'dispute: the private project''s jobs file'
+        default: data/third_jobs.json
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - id: p
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          python3 -c "
+          import json, os
+          jobs = json.loads(os.environ['JOBS'])
+          m = [dict(voice=j['voice'], surahs=str(j.get('surahs', '')), part=i) for i, j in enumerate(jobs)]
+          open(os.environ['GITHUB_OUTPUT'], 'a').write('matrix=' + json.dumps(m) + '\n')
+          "
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.parallel) }}
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - id: fcneed
+        env:
+          MODELS: ${{ inputs.models }}
+        run: python3 -m pipeline.alias --need "$MODELS" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: deps
+        env:
+          FCONLY: ${{ steps.fcneed.outputs.fconly }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            pip install -q imageio-ffmpeg==0.5.1
+            mkdir -p "$HOME/bin"
+            ln -sf "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" "$HOME/bin/ffmpeg"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/bin:$PATH"
+          fi
+          ffmpeg -version | head -1
+          if [ "$FCONLY" = 1 ] && [ "$MODE" = dispute ]; then
+            pip install -q numpy==1.26.4 numba==0.60.0
+          else
+            pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+            pip install -q -r requirements.txt
+          fi
+      - uses: actions/cache@v4
+        if: steps.fcneed.outputs.on == '1'
+        with:
+          path: /tmp/envb
+          key: env-b-v1
+      - name: deps b
+        if: steps.fcneed.outputs.on == '1'
+        run: bash kit/ci/env_b.sh /tmp/envb
+      - uses: actions/checkout@v4
+        if: steps.fcneed.outputs.own == '1'
+        with:
+          repository: Mulhimfy/ayahreel-words
+          ref: weights
+          path: wts
+          ssh-key: ${{ secrets.WORDS_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: weights
+        if: steps.fcneed.outputs.own == '1'
+        run: |
+          for d in wts/*/; do
+            if ls "$d"model.safetensors.part* >/dev/null 2>&1; then
+              cat "$d"model.safetensors.part* > "$d"model.safetensors
+              rm -f "$d"model.safetensors.part*
+            fi
+          done
+          rm -rf wts/.git
+          echo "FCR_ROOT=$PWD/wts" >> "$GITHUB_ENV"
+      - id: key
+        env:
+          MODELS: ${{ inputs.models }}
+        run: echo "key=models-$(echo "$MODELS" | tr ',' '-')-v1" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ steps.key.outputs.key }}
+      - name: run
+        timeout-minutes: 330
+        env:
+          MODE: ${{ inputs.mode }}
+          VOICE: ${{ matrix.voice }}
+          SURAHS: ${{ matrix.surahs }}
+          MODELS: ${{ inputs.models }}
+          EXTRA: ${{ inputs.extra }}
+          JOBS_FILE: ${{ inputs.jobs_file }}
+        run: |
+          mkdir -p out log
+          MODELS=$(python -m pipeline.alias "$MODELS")
+          args=(--voice "$VOICE" --models "$MODELS" --out out --work work)
+          if [ "$MODE" = eval ]; then
+            case "$SURAHS" in
+              small|big) args+=(--sample "$SURAHS") ;;
+              *) args+=(--surahs "$SURAHS") ;;
+            esac
+          else
+            args+=(--jobs "${JOBS_FILE:-data/third_jobs.json}")
+            [ -n "$SURAHS" ] && args+=(--surahs "$SURAHS")
+          fi
+          if ! python -m pipeline.run_third "$MODE" "${args[@]}" $EXTRA \
+              > log/log.txt 2>&1; then
+            echo "the job failed; its log is in the encrypted output"
+            exit 1
+          fi
+          echo "done"
+      - name: seal
+        if: always()
+        env:
+          KEY: ${{ secrets.WORDS_ENC_KEY }}
+        run: |
+          mkdir -p out log sealed
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:KEY -out sealed/third.tgz.enc
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY \
+            -in log/log.txt -out sealed/log.txt.enc 2>/dev/null || true
+          rm -rf out log work wts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: third-${{ inputs.tag }}-${{ matrix.voice }}-${{ matrix.part }}
+          path: sealed
+          retention-days: 30
